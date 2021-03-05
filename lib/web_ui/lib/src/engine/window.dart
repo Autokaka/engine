@@ -2,51 +2,59 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// @dart = 2.10
+// @dart = 2.12
 part of engine;
 
 /// When set to true, all platform messages will be printed to the console.
 const bool/*!*/ _debugPrintPlatformMessages = false;
 
-/// The Web implementation of [ui.Window].
-// TODO(gspencergoog): Once the framework no longer uses ui.Window, make this extend
-// ui.SingletonFlutterWindow instead.
-class EngineFlutterWindow extends ui.Window {
+/// Whether [_customUrlStrategy] has been set or not.
+///
+/// It is valid to set [_customUrlStrategy] to null, so we can't use a null
+/// check to determine whether it was set or not. We need an extra boolean.
+bool _isUrlStrategySet = false;
+
+/// A custom URL strategy set by the app before running.
+UrlStrategy? _customUrlStrategy;
+set customUrlStrategy(UrlStrategy? strategy) {
+  assert(!_isUrlStrategySet, 'Cannot set URL strategy more than once.');
+  _isUrlStrategySet = true;
+  _customUrlStrategy = strategy;
+}
+
+/// The Web implementation of [ui.SingletonFlutterWindow].
+class EngineFlutterWindow extends ui.SingletonFlutterWindow {
   EngineFlutterWindow(this._windowId, this.platformDispatcher) {
     final EnginePlatformDispatcher engineDispatcher = platformDispatcher as EnginePlatformDispatcher;
     engineDispatcher._windows[_windowId] = this;
     engineDispatcher._windowConfigurations[_windowId] = ui.ViewConfiguration();
-    _addUrlStrategyListener();
+    if (_isUrlStrategySet) {
+      _browserHistory =
+          MultiEntriesBrowserHistory(urlStrategy: _customUrlStrategy);
+    }
+    registerHotRestartListener(() {
+      window.resetHistory();
+    });
   }
 
   final Object _windowId;
   final ui.PlatformDispatcher platformDispatcher;
 
-  void _addUrlStrategyListener() {
-    _jsSetUrlStrategy = allowInterop((JsUrlStrategy? jsStrategy) {
-      assert(
-        _browserHistory == null,
-        'Cannot set URL strategy more than once.',
-      );
-      final UrlStrategy? strategy =
-          jsStrategy == null ? null : CustomUrlStrategy.fromJs(jsStrategy);
-      _browserHistory = MultiEntriesBrowserHistory(urlStrategy: strategy);
-    });
-    registerHotRestartListener(() {
-      _jsSetUrlStrategy = null;
-    });
-  }
-
   /// Handles the browser history integration to allow users to use the back
   /// button, etc.
   @visibleForTesting
   BrowserHistory get browserHistory {
+    final UrlStrategy? urlStrategy = _isUrlStrategySet
+        ? _customUrlStrategy
+        : _createDefaultUrlStrategy();
+    // Prevent any further customization of URL strategy.
+    _isUrlStrategySet = true;
     return _browserHistory ??=
-        MultiEntriesBrowserHistory(urlStrategy: _createDefaultUrlStrategy());
+        MultiEntriesBrowserHistory(urlStrategy: urlStrategy);
   }
 
   BrowserHistory? _browserHistory;
-
+  bool _usingRouter = false;
   Future<void> _useSingleEntryBrowserHistory() async {
     if (_browserHistory is SingleEntryBrowserHistory) {
       return;
@@ -56,11 +64,23 @@ class EngineFlutterWindow extends ui.Window {
     _browserHistory = SingleEntryBrowserHistory(urlStrategy: strategy);
   }
 
+  Future<void> _useMultiEntryBrowserHistory() async {
+    if (_browserHistory is MultiEntriesBrowserHistory) {
+      return;
+    }
+    final UrlStrategy? strategy = _browserHistory?.urlStrategy;
+    await _browserHistory?.tearDown();
+    _browserHistory = MultiEntriesBrowserHistory(urlStrategy: strategy);
+  }
+
   @visibleForTesting
   Future<void> debugInitializeHistory(
-      UrlStrategy? strategy, {
-        required bool useSingle,
-      }) async {
+    UrlStrategy? strategy, {
+    required bool useSingle,
+  }) async {
+    // Prevent any further customization of URL strategy.
+    _isUrlStrategySet = true;
+    _usingRouter = false;
     await _browserHistory?.tearDown();
     if (useSingle) {
       _browserHistory = SingleEntryBrowserHistory(urlStrategy: strategy);
@@ -69,10 +89,13 @@ class EngineFlutterWindow extends ui.Window {
     }
   }
 
-  @visibleForTesting
-  Future<void> debugResetHistory() async {
+  Future<void> resetHistory() async {
     await _browserHistory?.tearDown();
     _browserHistory = null;
+    // Reset the globals too.
+    _usingRouter = false;
+    _isUrlStrategySet = false;
+    _customUrlStrategy = null;
   }
 
   Future<bool> handleNavigationMessage(
@@ -83,11 +106,22 @@ class EngineFlutterWindow extends ui.Window {
 
     switch (decoded.method) {
       case 'routeUpdated':
-        await _useSingleEntryBrowserHistory();
-        browserHistory.setRouteName(arguments['routeName']);
+        if (!_usingRouter) {
+          await _useSingleEntryBrowserHistory();
+          browserHistory.setRouteName(arguments['routeName']);
+        } else {
+          assert(
+            false,
+            'Receives old navigator update in a router application. '
+            'This can happen if you use non-router versions of MaterialApp/'
+            'CupertinoApp/WidgetsApp together with the router versions of them.'
+          );
+          return false;
+        }
         return true;
       case 'routeInformationUpdated':
-        assert(browserHistory is MultiEntriesBrowserHistory);
+        await _useMultiEntryBrowserHistory();
+        _usingRouter = true;
         browserHistory.setRouteName(
           arguments['location'],
           state: arguments['state'],
@@ -222,6 +256,7 @@ typedef _JsSetUrlStrategy = void Function(JsUrlStrategy?);
 //
 // TODO: Add integration test https://github.com/flutter/flutter/issues/66852
 @JS('_flutter_web_set_location_strategy')
+// ignore: unused_element
 external set _jsSetUrlStrategy(_JsSetUrlStrategy? newJsSetUrlStrategy);
 
 UrlStrategy? _createDefaultUrlStrategy() {
@@ -230,7 +265,7 @@ UrlStrategy? _createDefaultUrlStrategy() {
       : const HashUrlStrategy();
 }
 
-/// The Web implementation of [ui.Window].
+/// The Web implementation of [ui.SingletonFlutterWindow].
 class EngineSingletonFlutterWindow extends EngineFlutterWindow {
   EngineSingletonFlutterWindow(Object windowId, ui.PlatformDispatcher platformDispatcher) : super(windowId, platformDispatcher);
 
